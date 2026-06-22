@@ -1,21 +1,26 @@
 /*
- * Button latch with hold-to-off.
+ * PC power button controller (Elegoo / Arduino Nano).
  *
- *   Short press (tap)     -> D7 goes HIGH and stays HIGH
- *   Hold while D7 is HIGH -> after HOLD_MS, D7 goes LOW
- *   Off button press      -> D7 goes LOW if it is on
+ *   Short press D3             -> D7 latches HIGH if it was off
+ *   Short press D3 while D7 on -> pulse D2 HIGH briefly (PC power switch)
+ *   Hold D3 while D7 is HIGH   -> after HOLD_MS, D7 goes LOW
+ *   Off input on D5            -> D7 goes LOW if it is on
  *
  * Pin numbers in code are the *digital* pin numbers, not always the silkscreen label:
  *
- *   Silkscreen D0-D13  ->  use 0-13 in code (D3 = 3, D7 = 7)
+ *   Silkscreen D0-D13  ->  use 0-13 in code (D2 = 2, D3 = 3, D7 = 7)
  *   Silkscreen A0-A5   ->  use A0-A5 or 14-19 (A3 = A3 = 17)
  *   Silkscreen A6-A7   ->  analog only, cannot use digitalRead/digitalWrite
  *
- * Wiring (Elegoo / Arduino Nano):
- *   D7 -> load (LED, relay, etc.)
+ * Wiring:
+ *   D2 -> motherboard power switch header
+ *   D3 -> front-panel button to GND
+ *   D5 -> off signal (button to GND or Pi GPIO)
+ *   D7 -> latched status output (LED, relay, etc.)
  */
 
-const int BUTTON_PIN = 3;  // silkscreen D3; use A3 if wired to analog header A3
+const int BUTTON_PIN = 3;  // silkscreen D3
+const int PULSE_PIN = 2;   // silkscreen D2
 const int OFF_PIN = 5;     // silkscreen D5
 const int OUTPUT_PIN = 7;  // silkscreen D7
 
@@ -25,7 +30,8 @@ const bool BUTTON_TO_GND = true;
 const bool OFF_TO_GND = true;
 
 const unsigned long HOLD_MS = 2000;
-const unsigned long DEBOUNCE_MS = 50;
+const unsigned long PULSE_MS = 250;
+const unsigned long DEBOUNCE_MS = 25;
 const unsigned long OFF_DEBOUNCE_MS = 100;
 
 bool outputOn = false;
@@ -33,13 +39,17 @@ bool lastReading = false;
 bool debouncedPressed = false;
 bool lastDebouncedPressed = false;
 unsigned long lastDebounceTime = 0;
-unsigned long holdStartTime = 0;
-bool holdOffTriggered = false;
+unsigned long pressStartTime = 0;
+bool latchedOnThisPress = false;
+bool holdOffThisPress = false;
 
 bool offLastReading = false;
 bool offDebouncedPressed = false;
 bool lastOffDebouncedPressed = false;
 unsigned long offDebounceTime = 0;
+
+bool pulseActive = false;
+unsigned long pulseEndTime = 0;
 
 void configureInputPin(int pin, bool toGnd) {
   pinMode(pin, toGnd ? INPUT_PULLUP : INPUT);
@@ -64,6 +74,29 @@ void setOutput(bool on, const char* reason) {
   Serial.print(" (");
   Serial.print(reason);
   Serial.println(")");
+}
+
+void startPulse() {
+  digitalWrite(PULSE_PIN, HIGH);
+  pulseActive = true;
+  pulseEndTime = millis() + PULSE_MS;
+
+  Serial.print("D2 (pin ");
+  Serial.print(PULSE_PIN);
+  Serial.print("): pulse ");
+  Serial.print(PULSE_MS);
+  Serial.println(" ms");
+}
+
+void updatePulse() {
+  if (pulseActive && millis() >= pulseEndTime) {
+    digitalWrite(PULSE_PIN, LOW);
+    pulseActive = false;
+
+    Serial.print("D2 (pin ");
+    Serial.print(PULSE_PIN);
+    Serial.println("): LOW");
+  }
 }
 
 void updateDebouncedButton() {
@@ -99,7 +132,9 @@ void setup() {
 
   configureInputPin(BUTTON_PIN, BUTTON_TO_GND);
   configureInputPin(OFF_PIN, OFF_TO_GND);
+  pinMode(PULSE_PIN, OUTPUT);
   pinMode(OUTPUT_PIN, OUTPUT);
+  digitalWrite(PULSE_PIN, LOW);
   digitalWrite(OUTPUT_PIN, LOW);
 
   lastReading = readInputPressed(BUTTON_PIN, BUTTON_TO_GND);
@@ -109,36 +144,65 @@ void setup() {
   offDebouncedPressed = offLastReading;
   lastOffDebouncedPressed = offDebouncedPressed;
 
-  Serial.println("Ready. Short press = on, hold 2s while on = off, off button = off.");
+  Serial.println("Ready v2. Short press latches D7; short press while on = D2 pulse.");
+  Serial.println("D2 (pin 2): LOW");
   Serial.println("D7 (pin 7): LOW");
 }
 
 void loop() {
   updateDebouncedButton();
   updateDebouncedOffButton();
+  updatePulse();
 
   if (offDebouncedPressed && !lastOffDebouncedPressed && outputOn) {
     setOutput(false, "off button");
-    holdOffTriggered = true;
   }
 
   if (debouncedPressed && !lastDebouncedPressed) {
+    latchedOnThisPress = false;
+    holdOffThisPress = false;
+    pressStartTime = millis();
+    Serial.print("D3: pressed (D7 ");
+    Serial.print(outputOn ? "on" : "off");
+    Serial.println(")");
     if (!outputOn) {
       setOutput(true, "short press");
+      latchedOnThisPress = true;
     }
-    holdStartTime = millis();
-    holdOffTriggered = false;
   }
 
-  if (debouncedPressed && outputOn && !holdOffTriggered) {
-    if (millis() - holdStartTime >= HOLD_MS) {
+  if (debouncedPressed && outputOn && !holdOffThisPress) {
+    if (millis() - pressStartTime >= HOLD_MS) {
       setOutput(false, "held to turn off");
-      holdOffTriggered = true;
+      holdOffThisPress = true;
     }
   }
 
-  if (!debouncedPressed) {
-    holdOffTriggered = false;
+  if (!debouncedPressed && lastDebouncedPressed) {
+    unsigned long pressDuration = millis() - pressStartTime;
+    bool shortPress = pressDuration < HOLD_MS;
+    bool shouldPulse = shortPress && outputOn && !latchedOnThisPress && !holdOffThisPress;
+
+    Serial.print("D3: released (");
+    Serial.print(pressDuration);
+    Serial.print(" ms) outputOn=");
+    Serial.print(outputOn ? 1 : 0);
+    Serial.print(" latched=");
+    Serial.print(latchedOnThisPress ? 1 : 0);
+    Serial.print(" holdOff=");
+    Serial.println(holdOffThisPress ? 1 : 0);
+
+    if (shouldPulse) {
+      startPulse();
+    } else if (shortPress && latchedOnThisPress) {
+      Serial.println("D2: pulse skipped (this press latched D7 on)");
+    } else if (shortPress && holdOffThisPress) {
+      Serial.println("D2: pulse skipped (held to turn off)");
+    } else if (shortPress && !outputOn) {
+      Serial.println("D2: pulse skipped (D7 is off)");
+    } else {
+      Serial.println("D2: pulse skipped (long press)");
+    }
   }
 
   lastDebouncedPressed = debouncedPressed;

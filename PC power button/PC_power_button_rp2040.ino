@@ -1,20 +1,16 @@
 /*
- * Button latch with hold-to-off (RP2040 / Raspberry Pi Pico).
+ * PC power button controller (RP2040 / Raspberry Pi Pico).
  *
- *   Short press (tap)     -> OUTPUT_PIN goes HIGH and stays HIGH
- *   Hold while on         -> after HOLD_MS, OUTPUT_PIN goes LOW
- *   Off button press      -> OUTPUT_PIN goes LOW if it is on
- *
- * Pin numbers are GPIO numbers (GP0, GP1, ...):
- *
- *   Silkscreen GP3  ->  use 3 in code
- *   Silkscreen GP5  ->  use 5 in code
- *   Silkscreen GP7  ->  use 7 in code
+ *   Short press GP3             -> GP7 latches HIGH if it was off
+ *   Short press GP3 while GP7 on -> pulse GP2 HIGH briefly (PC power switch)
+ *   Hold GP3 while GP7 is HIGH  -> after HOLD_MS, GP7 goes LOW
+ *   Off input on GP5            -> GP7 goes LOW if it is on
  *
  * Note: Pico GPIO is 3.3V only. Do not drive pins above 3.3V.
  */
 
 const int BUTTON_PIN = 3;  // GP3
+const int PULSE_PIN = 2;   // GP2
 const int OFF_PIN = 5;     // GP5
 const int OUTPUT_PIN = 7;  // GP7
 
@@ -24,7 +20,8 @@ const bool BUTTON_TO_GND = true;
 const bool OFF_TO_GND = true;
 
 const unsigned long HOLD_MS = 2000;
-const unsigned long DEBOUNCE_MS = 50;
+const unsigned long PULSE_MS = 250;
+const unsigned long DEBOUNCE_MS = 25;
 const unsigned long OFF_DEBOUNCE_MS = 100;
 
 bool outputOn = false;
@@ -32,13 +29,17 @@ bool lastReading = false;
 bool debouncedPressed = false;
 bool lastDebouncedPressed = false;
 unsigned long lastDebounceTime = 0;
-unsigned long holdStartTime = 0;
-bool holdOffTriggered = false;
+unsigned long pressStartTime = 0;
+bool latchedOnThisPress = false;
+bool holdOffThisPress = false;
 
 bool offLastReading = false;
 bool offDebouncedPressed = false;
 bool lastOffDebouncedPressed = false;
 unsigned long offDebounceTime = 0;
+
+bool pulseActive = false;
+unsigned long pulseEndTime = 0;
 
 void configureInputPin(int pin, bool toGnd) {
   pinMode(pin, toGnd ? INPUT_PULLUP : INPUT_PULLDOWN);
@@ -63,6 +64,29 @@ void setOutput(bool on, const char* reason) {
   Serial.print(" (");
   Serial.print(reason);
   Serial.println(")");
+}
+
+void startPulse() {
+  digitalWrite(PULSE_PIN, HIGH);
+  pulseActive = true;
+  pulseEndTime = millis() + PULSE_MS;
+
+  Serial.print("GP");
+  Serial.print(PULSE_PIN);
+  Serial.print(": pulse ");
+  Serial.print(PULSE_MS);
+  Serial.println(" ms");
+}
+
+void updatePulse() {
+  if (pulseActive && millis() >= pulseEndTime) {
+    digitalWrite(PULSE_PIN, LOW);
+    pulseActive = false;
+
+    Serial.print("GP");
+    Serial.print(PULSE_PIN);
+    Serial.println(": LOW");
+  }
 }
 
 void updateDebouncedButton() {
@@ -101,7 +125,9 @@ void setup() {
 
   configureInputPin(BUTTON_PIN, BUTTON_TO_GND);
   configureInputPin(OFF_PIN, OFF_TO_GND);
+  pinMode(PULSE_PIN, OUTPUT);
   pinMode(OUTPUT_PIN, OUTPUT);
+  digitalWrite(PULSE_PIN, LOW);
   digitalWrite(OUTPUT_PIN, LOW);
 
   lastReading = readInputPressed(BUTTON_PIN, BUTTON_TO_GND);
@@ -111,36 +137,65 @@ void setup() {
   offDebouncedPressed = offLastReading;
   lastOffDebouncedPressed = offDebouncedPressed;
 
-  Serial.println("Ready. Short press = on, hold 2s while on = off, off button = off.");
+  Serial.println("Ready v2. Short press latches GP7; short press while on = GP2 pulse.");
+  Serial.println("GP2: LOW");
   Serial.println("GP7: LOW");
 }
 
 void loop() {
   updateDebouncedButton();
   updateDebouncedOffButton();
+  updatePulse();
 
   if (offDebouncedPressed && !lastOffDebouncedPressed && outputOn) {
     setOutput(false, "off button");
-    holdOffTriggered = true;
   }
 
   if (debouncedPressed && !lastDebouncedPressed) {
+    latchedOnThisPress = false;
+    holdOffThisPress = false;
+    pressStartTime = millis();
+    Serial.print("GP3: pressed (GP7 ");
+    Serial.print(outputOn ? "on" : "off");
+    Serial.println(")");
     if (!outputOn) {
       setOutput(true, "short press");
+      latchedOnThisPress = true;
     }
-    holdStartTime = millis();
-    holdOffTriggered = false;
   }
 
-  if (debouncedPressed && outputOn && !holdOffTriggered) {
-    if (millis() - holdStartTime >= HOLD_MS) {
+  if (debouncedPressed && outputOn && !holdOffThisPress) {
+    if (millis() - pressStartTime >= HOLD_MS) {
       setOutput(false, "held to turn off");
-      holdOffTriggered = true;
+      holdOffThisPress = true;
     }
   }
 
-  if (!debouncedPressed) {
-    holdOffTriggered = false;
+  if (!debouncedPressed && lastDebouncedPressed) {
+    unsigned long pressDuration = millis() - pressStartTime;
+    bool shortPress = pressDuration < HOLD_MS;
+    bool shouldPulse = shortPress && outputOn && !latchedOnThisPress && !holdOffThisPress;
+
+    Serial.print("GP3: released (");
+    Serial.print(pressDuration);
+    Serial.print(" ms) outputOn=");
+    Serial.print(outputOn ? 1 : 0);
+    Serial.print(" latched=");
+    Serial.print(latchedOnThisPress ? 1 : 0);
+    Serial.print(" holdOff=");
+    Serial.println(holdOffThisPress ? 1 : 0);
+
+    if (shouldPulse) {
+      startPulse();
+    } else if (shortPress && latchedOnThisPress) {
+      Serial.println("GP2: pulse skipped (this press latched GP7 on)");
+    } else if (shortPress && holdOffThisPress) {
+      Serial.println("GP2: pulse skipped (held to turn off)");
+    } else if (shortPress && !outputOn) {
+      Serial.println("GP2: pulse skipped (GP7 is off)");
+    } else {
+      Serial.println("GP2: pulse skipped (long press)");
+    }
   }
 
   lastDebouncedPressed = debouncedPressed;

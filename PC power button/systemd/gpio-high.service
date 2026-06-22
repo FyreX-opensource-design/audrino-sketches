@@ -1,0 +1,18 @@
+[Unit]
+Description=Trigger script on GPIO 0-to-1 transition (gpiochip1 line 92)
+After=multi-user.target
+
+[Service]
+Type=simple
+Environment=GPIO_CHIP=gpiochip1
+Environment=GPIO_LINE=92
+Environment=TRIGGER_SCRIPT=/usr/local/bin/on-gpio-high.sh
+ExecStart=/usr/local/bin/gpio-high-monitor.sh
+Restart=on-failure
+RestartSec=2
+
+# GPIO access usually requires root unless udev rules grant the service user access.
+User=root
+
+[Install]
+WantedBy=multi-user.target
